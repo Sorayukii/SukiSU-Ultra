@@ -21,18 +21,14 @@
 #include "kernel_umount.h"
 #include "manager.h"
 #include "selinux/selinux.h"
-#include "objsec.h"
 #include "file_wrapper.h"
 #include "syscall_hook_manager.h"
-#include "throne_comm.h"
 #include "dynamic_manager.h"
 
 #include "sulog.h"
 #ifdef CONFIG_KSU_MANUAL_SU
 #include "manual_su.h"
 #endif
-
-bool ksu_uid_scanner_enabled = false;
 
 // Permission check functions
 bool only_manager(void)
@@ -64,17 +60,6 @@ bool allowed_for_su(void)
                                       is_allowed);
 #endif
     return is_allowed;
-}
-
-static void init_uid_scanner(void)
-{
-    ksu_throne_comm_load_state();
-    if (ksu_uid_scanner_enabled) {
-        int ret = ksu_throne_comm_init();
-        if (ret != 0) {
-            pr_err("Failed to initialize throne communication: %d\n", ret);
-        }
-    }
 }
 
 static int do_grant_root(void __user *arg)
@@ -122,7 +107,6 @@ static int do_report_event(void __user *arg)
             post_fs_data_lock = true;
             pr_info("post-fs-data triggered\n");
             on_post_fs_data();
-            init_uid_scanner();
 #if __SULOG_GATE
             ksu_sulog_init();
 #endif
@@ -369,52 +353,12 @@ static int do_get_wrapper_fd(void __user *arg)
     }
 
     struct ksu_get_wrapper_fd_cmd cmd;
-    int ret;
-
     if (copy_from_user(&cmd, arg, sizeof(cmd))) {
         pr_err("get_wrapper_fd: copy_from_user failed\n");
         return -EFAULT;
     }
 
-    struct file *f = fget(cmd.fd);
-    if (!f) {
-        return -EBADF;
-    }
-
-    struct ksu_file_wrapper *data = ksu_create_file_wrapper(f);
-    if (data == NULL) {
-        ret = -ENOMEM;
-        goto put_orig_file;
-    }
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-#define getfd_secure anon_inode_create_getfd
-#else
-#define getfd_secure anon_inode_getfd_secure
-#endif
-    ret = getfd_secure("[ksu_fdwrapper]", &data->ops, data, f->f_flags, NULL);
-    if (ret < 0) {
-        pr_err("ksu_fdwrapper: getfd failed: %d\n", ret);
-        goto put_wrapper_data;
-    }
-    struct file *pf = fget(ret);
-
-    struct inode *wrapper_inode = file_inode(pf);
-    // copy original inode mode
-    wrapper_inode->i_mode = file_inode(f)->i_mode;
-    struct inode_security_struct *sec = selinux_inode(wrapper_inode);
-    if (sec) {
-        sec->sid = ksu_file_sid;
-    }
-
-    fput(pf);
-    goto put_orig_file;
-put_wrapper_data:
-    ksu_delete_file_wrapper(data);
-put_orig_file:
-    fput(f);
-
-    return ret;
+    return ksu_install_file_wrapper(cmd.fd);
 }
 
 static int do_manage_mark(void __user *arg)
@@ -763,68 +707,6 @@ static int do_get_managers(void __user *arg)
     return 0;
 }
 
-static int do_enable_uid_scanner(void __user *arg)
-{
-    struct ksu_enable_uid_scanner_cmd cmd;
-
-    if (copy_from_user(&cmd, arg, sizeof(cmd))) {
-        pr_err("enable_uid_scanner: copy_from_user failed\n");
-        return -EFAULT;
-    }
-
-    switch (cmd.operation) {
-    case UID_SCANNER_OP_GET_STATUS: {
-        bool status = ksu_uid_scanner_enabled;
-        if (copy_to_user((void __user *)cmd.status_ptr, &status,
-                         sizeof(status))) {
-            pr_err("enable_uid_scanner: copy status failed\n");
-            return -EFAULT;
-        }
-        break;
-    }
-    case UID_SCANNER_OP_TOGGLE: {
-        bool enabled = cmd.enabled;
-
-        if (enabled == ksu_uid_scanner_enabled) {
-            pr_info("enable_uid_scanner: no need to change, already %s\n",
-                    enabled ? "enabled" : "disabled");
-            break;
-        }
-
-        if (enabled) {
-            // Enable UID scanner
-            int ret = ksu_throne_comm_init();
-            if (ret != 0) {
-                pr_err("enable_uid_scanner: failed to initialize: %d\n", ret);
-                return -EFAULT;
-            }
-            pr_info("enable_uid_scanner: enabled\n");
-        } else {
-            // Disable UID scanner
-            ksu_throne_comm_exit();
-            pr_info("enable_uid_scanner: disabled\n");
-        }
-
-        ksu_uid_scanner_enabled = enabled;
-        ksu_throne_comm_save_state();
-        break;
-    }
-    case UID_SCANNER_OP_CLEAR_ENV: {
-        // Clear environment (force exit)
-        ksu_throne_comm_exit();
-        ksu_uid_scanner_enabled = false;
-        ksu_throne_comm_save_state();
-        pr_info("enable_uid_scanner: environment cleared\n");
-        break;
-    }
-    default:
-        pr_err("enable_uid_scanner: invalid operation\n");
-        return -EINVAL;
-    }
-
-    return 0;
-}
-
 #ifdef CONFIG_KSU_MANUAL_SU
 static bool system_uid_check(void)
 {
@@ -963,10 +845,6 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
     { .cmd = KSU_IOCTL_GET_MANAGERS,
       .name = "GET_MANAGERS",
       .handler = do_get_managers,
-      .perm_check = manager_or_root },
-    { .cmd = KSU_IOCTL_ENABLE_UID_SCANNER,
-      .name = "SET_ENABLE_UID_SCANNER",
-      .handler = do_enable_uid_scanner,
       .perm_check = manager_or_root },
 #ifdef CONFIG_KSU_MANUAL_SU
     { .cmd = KSU_IOCTL_MANUAL_SU,
